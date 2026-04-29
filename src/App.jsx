@@ -151,6 +151,10 @@ export default function AIProofChecker() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ system, user })
     });
+    if (res.status === 429) {
+      const data = await res.json();
+      throw new Error(data.error || "Daily limit reached. Come back tomorrow!");
+    }
     const data = await res.json();
     const text = data.content?.[0]?.text || "{}";
     return JSON.parse(text.replace(/```json|```/g, "").trim());
@@ -174,7 +178,10 @@ export default function AIProofChecker() {
     for (let i = 0; i < DIMS.length; i++) {
       setLoadingIndex(i);
       try { dimResults[DIMS[i].id] = await callAPI("You are a GEO expert. Respond ONLY with valid JSON, no markdown, no backticks.", `${DIMS[i].prompt}\n\nCONTENT:\n"""\n${fullContent}\n"""`); }
-      catch { dimResults[DIMS[i].id] = { score: 5, verdict: "Weak", finding: "Could not analyze.", fix: null, rewrite: null }; }
+      catch (e) {
+        if (e.message.includes("limit")) { setError(e.message); setLoading(false); return; }
+        dimResults[DIMS[i].id] = { score: 5, verdict: "Weak", finding: "Could not analyze.", fix: null, rewrite: null };
+      }
     }
     setResults(dimResults);
     if (targetQuery.trim()) {
