@@ -168,7 +168,8 @@ export default function AIProofChecker() {
       : "";
     const effectivePlatform = effectivePlatforms[0] || ""; // primary for buildDimensions
     const DIMS = buildDimensions(title, effectivePlatform);
-    const fullContent = `${title ? `TITLE: ${title}\n\n` : ""}${platformLabels ? `PLATFORMS: ${platformLabels}\n\n` : ""}BODY:\n${body}`;
+    const truncatedBody = body.trim().slice(0, 3000);
+    const fullContent = `${title ? `TITLE: ${title}\n\n` : ""}${platformLabels ? `PLATFORMS: ${platformLabels}\n\n` : ""}BODY:\n${truncatedBody}`;
     const dimResults = {};
     for (let i = 0; i < DIMS.length; i++) {
       setLoadingIndex(i);
