@@ -1,9 +1,5 @@
 // api/analyze.js
-// Serverless function — runs on Vercel's servers, never exposes your API key to the browser
-
-export const config = {
-  api: { bodyParser: true }
-};
+export const config = { api: { bodyParser: true } };
 
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -17,11 +13,21 @@ export default async function handler(req, res) {
   if (!apiKey) return res.status(500).json({ error: "API key not configured" });
 
   try {
-    const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
-    const { system, user } = body || {};
+    // Handle both parsed and unparsed body
+    let body = req.body;
+    if (typeof body === "string") {
+      try { body = JSON.parse(body); } catch { return res.status(400).json({ error: "Invalid JSON body" }); }
+    }
+
+    const system = body?.system;
+    const user = body?.user;
 
     if (!system || !user) {
-      return res.status(400).json({ error: "Missing system or user message", received: { system: !!system, user: !!user } });
+      return res.status(400).json({ 
+        error: "Missing system or user",
+        bodyType: typeof req.body,
+        keys: body ? Object.keys(body) : []
+      });
     }
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
@@ -32,7 +38,7 @@ export default async function handler(req, res) {
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
+        model: "claude-3-5-sonnet-20241022",
         max_tokens: 1000,
         temperature: 0,
         system,
@@ -40,12 +46,10 @@ export default async function handler(req, res) {
       }),
     });
 
-    if (!response.ok) {
-      const err = await response.text();
-      return res.status(response.status).json({ error: err });
-    }
-
     const data = await response.json();
+    if (!response.ok) {
+      return res.status(400).json({ error: "Anthropic error", details: data });
+    }
     return res.status(200).json(data);
   } catch (err) {
     return res.status(500).json({ error: err.message });
