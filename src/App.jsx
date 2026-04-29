@@ -217,6 +217,7 @@ export default function AIProofChecker() {
   });
 
   const renderResults = (res, eng, score, s100, rnk, query, fx, titleVal, platVals, platOther) => {
+    if (!rnk) return null;
     const platArray = Array.isArray(platVals) ? platVals : platVals ? [platVals] : [];
     const RenderDIMS = buildDimensions(titleVal, platArray[0] || "");
     return (
