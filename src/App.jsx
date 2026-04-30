@@ -138,6 +138,8 @@ export default function AIProofChecker() {
   const [shareMsg, setShareMsg] = useState("");
   const [sharedView, setSharedView] = useState(null);
   const [focused, setFocused] = useState(null);
+  const [surfacingResults, setSurfacingResults] = useState(null);
+  const [surfacingLoading, setSurfacingLoading] = useState(false);
   const resultsRef = useRef(null);
 
   useEffect(() => {
@@ -162,7 +164,7 @@ export default function AIProofChecker() {
 
   const analyze = async () => {
     if (!body.trim() || body.trim().length < 50) { setError("Paste your content body first — at least a paragraph."); return; }
-    setError(""); setLoading(true); setResults(null); setEngineResults(null); setSharedView(null);
+    setError(""); setLoading(true); setResults(null); setEngineResults(null); setSharedView(null); setSurfacingResults(null); setSurfacingLoading(false);
     const hasOther = platforms.includes("other");
     const namedPlatforms = platforms.filter(p => p !== "other");
     const effectivePlatforms = [...namedPlatforms, ...(hasOther && platformOther ? [platformOther] : [])];
@@ -184,16 +186,81 @@ export default function AIProofChecker() {
       }
     }
     setResults(dimResults);
+
+    // Compute structural score to pass into engine prompt
+    const structuralAvg = Object.values(dimResults).reduce((s, r) => s + (r.score || 0), 0) / DIMS.length;
+    const structuralScore100 = Math.round((structuralAvg / 10) * 100);
+
     if (targetQuery.trim()) {
       setLoadingIndex(DIMS.length);
       try {
-        setEngineResults(await callAPI("You are a GEO expert. Respond ONLY with valid JSON, no markdown.",
-          `Given content, title "${title || "untitled"}", platforms "${platformLabels || "unspecified"}", and query "${targetQuery}", assess citation likelihood for each AI engine.\nRespond with JSON only:\n{ "perplexity": { "likelihood": "<High or Medium or Low>", "reason": "<one sentence>" }, "chatgpt": { "likelihood": "<High or Medium or Low>", "reason": "<one sentence>" }, "gemini": { "likelihood": "<High or Medium or Low>", "reason": "<one sentence>" }, "grok": { "likelihood": "<High or Medium or Low>", "reason": "<one sentence>" }, "metaai": { "likelihood": "<High or Medium or Low>", "reason": "<one sentence>" }, "claude": { "likelihood": "<High or Medium or Low>", "reason": "<one sentence>" } }\nContent:\n"""\n${fullContent}\n"""`
-        ));
+        const rawEngineResults = await callAPI("You are a GEO expert. Respond ONLY with valid JSON, no markdown.",
+          `Given content, title "${title || "untitled"}", platforms "${platformLabels || "unspecified"}", and query "${targetQuery}", assess citation likelihood for each AI engine.\n\nIMPORTANT: The content has an overall structural quality score of ${structuralScore100}/100. Your likelihood ratings MUST reflect this. If structural score is below 60, no engine should be rated Higher than Medium regardless of topic relevance — poor structure means AI engines cannot reliably extract and cite this content. If structural score is below 40, no engine should be rated above Low. Topic relevance alone is not enough — the content must also be well-structured, specific, quotable, and authoritative to be cited.\n\nRespond with JSON only:\n{ "perplexity": { "likelihood": "<High or Medium or Low>", "reason": "<one sentence that references both topic relevance AND structural quality>" }, "chatgpt": { "likelihood": "<High or Medium or Low>", "reason": "<one sentence>" }, "gemini": { "likelihood": "<High or Medium or Low>", "reason": "<one sentence>" }, "grok": { "likelihood": "<High or Medium or Low>", "reason": "<one sentence>" }, "metaai": { "likelihood": "<High or Medium or Low>", "reason": "<one sentence>" }, "claude": { "likelihood": "<High or Medium or Low>", "reason": "<one sentence>" } }\nContent:\n"""\n${fullContent}\n"""`
+        );
+
+        // Hard cap: enforce score-based ceiling on engine likelihood
+        const capLikelihood = (likelihood) => {
+          if (structuralScore100 < 40) return "Low";
+          if (structuralScore100 < 60 && likelihood === "High") return "Medium";
+          return likelihood;
+        };
+
+        const cappedResults = {};
+        for (const [engine, data] of Object.entries(rawEngineResults)) {
+          cappedResults[engine] = {
+            ...data,
+            likelihood: capLikelihood(data.likelihood),
+            reason: structuralScore100 < 60 && data.likelihood === "High"
+              ? `${data.reason} (capped to Medium — structural score of ${structuralScore100}/100 is below the threshold for High citation likelihood)`
+              : data.reason
+          };
+        }
+        setEngineResults(cappedResults);
       } catch { setEngineResults(null); }
     }
     setLoading(false); setLoadingIndex(-1);
     setTimeout(() => resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 200);
+
+    // Fire surfacing search in background — doesn't block results showing
+    const searchQuery = targetQuery.trim() || title.trim() || body.trim().slice(0, 80);
+    if (searchQuery) {
+      setSurfacingLoading(true);
+      setSurfacingResults(null);
+      try {
+        // 1. Get top Google results via Serper
+        const searchRes = await fetch("/api/search", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query: searchQuery })
+        });
+        const searchData = await searchRes.json();
+        const rawResults = searchData.results || [];
+
+        if (rawResults.length > 0) {
+          // 2. Analyze gap between surfacing content and user's content
+          const gapAnalysis = await callAPI(
+            "You are a GEO expert. Respond ONLY with valid JSON, no markdown, no backticks.",
+            `Compare this user's content against these top-surfacing results for the query "${searchQuery}" and identify specific gaps.\n\nTop surfacing results:\n${rawResults.map((r, i) => `${i + 1}. "${r.title}" (${r.source})\n${r.snippet}`).join("\n\n")}\n\nUser's content (first 1000 chars):\n"""\n${body.slice(0, 1000)}\n"""\n\nFor each surfacing result, identify 2-3 specific structural properties that help it surface (e.g. "opens with direct answer", "named expert author", "specific statistic in first paragraph", "clear query-matched title").\n\nAlso identify 3 specific gaps — things the surfacing content has that the user's content lacks.\n\nRespond with JSON only:\n{\n  "results": [\n    { "title": "<title>", "source": "<source>", "url": "<url>", "reasons": ["<reason1>", "<reason2>"] }\n  ],\n  "gaps": ["<gap1>", "<gap2>", "<gap3>"]\n}`
+          );
+
+          setSurfacingResults({
+            query: searchQuery,
+            results: gapAnalysis.results?.map((r, i) => ({
+              ...r,
+              url: rawResults[i]?.link || "#",
+              source: rawResults[i]?.source || r.source,
+              date: rawResults[i]?.date || null,
+            })) || [],
+            gaps: gapAnalysis.gaps || []
+          });
+        }
+      } catch (e) {
+        console.error("Surfacing search failed:", e);
+        setSurfacingResults(null);
+      } finally {
+        setSurfacingLoading(false);
+      }
+    }
   };
 
   const DIMS = buildDimensions(title, platforms[0] || "");
@@ -285,7 +352,8 @@ export default function AIProofChecker() {
           <div style={{ background: "rgba(255,255,255,0.03)", border: "1.5px solid rgba(255,255,255,0.1)", borderRadius: "14px", padding: "18px 20px", marginBottom: "14px" }}>
             <div style={{ fontSize: "11px", color: "rgba(240,240,248,0.4)", letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: "12px" }}>General citation likelihood by engine</div>
             <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-              {Object.entries(res.platformFit.platformBreakdown).filter(([engine]) => ["perplexity", "chatgpt", "gemini", "grok", "metaai", "claude"].includes(engine)).map(([engine, likelihood]) => {
+              {Object.entries(res.platformFit.platformBreakdown).filter(([engine]) => ["perplexity", "chatgpt", "gemini", "grok", "metaai", "claude"].includes(engine)).map(([engine, rawLikelihood]) => {
+                const likelihood = s100 < 40 ? "Low" : s100 < 60 && rawLikelihood === "High" ? "Medium" : rawLikelihood;
                 const lc = likelihoodConfig[likelihood] || {};
                 return (
                   <div key={engine} style={{ display: "flex", alignItems: "center", gap: "6px", background: lc.bg, borderRadius: "8px", padding: "6px 12px" }}>
@@ -366,6 +434,77 @@ export default function AIProofChecker() {
         <div style={{ fontSize: "11px", color: "rgba(240,240,248,0.22)", lineHeight: 1.7, padding: "0 2px" }}>
           GEO and AEO are not deterministic. No tool can guarantee AI citations — this scores structural properties that correlate with citation, not a guarantee of outcome.
         </div>
+
+        {/* Surfacing results */}
+        {(surfacingLoading || surfacingResults) && (
+          <div style={{ marginTop: "14px" }}>
+            <div style={{ fontSize: "11px", color: "rgba(240,240,248,0.4)", letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: "12px" }}>
+              Content currently surfacing for queries like yours
+            </div>
+
+            {surfacingLoading && (
+              <div style={{ background: "rgba(255,255,255,0.03)", border: "1.5px solid rgba(255,255,255,0.08)", borderRadius: "14px", padding: "24px", textAlign: "center" }}>
+                <div style={{ display: "inline-flex", alignItems: "center", gap: "10px", color: "rgba(240,240,248,0.4)", fontSize: "13px" }}>
+                  <span style={{ display: "inline-block", width: "14px", height: "14px", border: "2px solid rgba(200,255,0,0.2)", borderTopColor: "#C8FF00", borderRadius: "50%", animation: "spin 0.7s linear infinite" }} />
+                  Searching what's surfacing for this query...
+                </div>
+              </div>
+            )}
+
+            {!surfacingLoading && surfacingResults && (
+              <>
+                <div style={{ fontSize: "12px", color: "rgba(240,240,248,0.35)", marginBottom: "12px", fontStyle: "italic" }}>
+                  Query: "{surfacingResults.query}"
+                </div>
+
+                <div style={{ display: "flex", flexDirection: "column", gap: "10px", marginBottom: "14px" }}>
+                  {surfacingResults.results?.map((r, i) => (
+                    <div key={i} style={{ background: "rgba(255,255,255,0.03)", border: "1.5px solid rgba(255,255,255,0.08)", borderRadius: "12px", padding: "16px 18px" }}>
+                      <div style={{ display: "flex", alignItems: "start", justifyContent: "space-between", gap: "12px", marginBottom: "10px" }}>
+                        <div>
+                          <a href={r.url} target="_blank" rel="noopener noreferrer"
+                            style={{ fontSize: "14px", fontWeight: "700", color: "#f0f0f8", fontFamily: "'Space Mono', monospace", textDecoration: "none", lineHeight: 1.3, display: "block", marginBottom: "4px" }}>
+                            {r.title}
+                          </a>
+                          <div style={{ fontSize: "11px", color: "rgba(240,240,248,0.35)" }}>
+                            {r.source}{r.date ? ` · ${r.date}` : ""}
+                          </div>
+                        </div>
+                        <span style={{ fontSize: "10px", fontWeight: "700", color: "#2d6a4f", background: "rgba(45,106,79,0.15)", border: "1px solid rgba(45,106,79,0.3)", borderRadius: "99px", padding: "3px 10px", whiteSpace: "nowrap", flexShrink: 0, fontFamily: "'Space Mono', monospace" }}>Surfacing</span>
+                      </div>
+                      {r.reasons?.length > 0 && (
+                        <div style={{ borderTop: "1px solid rgba(255,255,255,0.06)", paddingTop: "10px" }}>
+                          <div style={{ fontSize: "11px", color: "rgba(240,240,248,0.3)", marginBottom: "6px", textTransform: "uppercase", letterSpacing: "0.08em" }}>Why it surfaces</div>
+                          <div style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
+                            {r.reasons.map((reason, j) => (
+                              <span key={j} style={{ fontSize: "11px", color: "#00d4ff", background: "rgba(0,212,255,0.08)", border: "1px solid rgba(0,212,255,0.2)", borderRadius: "6px", padding: "3px 9px" }}>{reason}</span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+
+                {surfacingResults.gaps?.length > 0 && (
+                  <div style={{ background: "rgba(255,107,107,0.06)", border: "1.5px solid rgba(255,107,107,0.2)", borderRadius: "12px", padding: "18px 20px" }}>
+                    <div style={{ fontSize: "11px", color: "#FF6B6B", fontWeight: "700", letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: "12px" }}>
+                      What these have that your content doesn't
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+                      {surfacingResults.gaps.map((gap, i) => (
+                        <div key={i} style={{ display: "flex", gap: "10px", alignItems: "start" }}>
+                          <span style={{ color: "#FF6B6B", fontSize: "14px", flexShrink: 0, marginTop: "1px" }}>✗</span>
+                          <p style={{ fontSize: "13px", color: "rgba(240,240,248,0.6)", margin: 0, lineHeight: 1.6 }}>{gap}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        )}
       </div>
     );
   };
