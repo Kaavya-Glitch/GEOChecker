@@ -1,5 +1,39 @@
 import { useState, useEffect, useRef } from "react";
 
+// Converts pasted HTML (from Google Docs, Notion, Medium etc) to clean markdown-style text
+// preserving heading hierarchy, bold, lists — so structure scoring is accurate
+function htmlToText(html) {
+  const div = document.createElement("div");
+  div.innerHTML = html;
+
+  const convert = (node) => {
+    if (node.nodeType === Node.TEXT_NODE) return node.textContent;
+    if (node.nodeType !== Node.ELEMENT_NODE) return "";
+
+    const tag = node.tagName.toLowerCase();
+    const children = Array.from(node.childNodes).map(convert).join("");
+
+    if (tag === "h1") return `# ${children}\n\n`;
+    if (tag === "h2") return `## ${children}\n\n`;
+    if (tag === "h3") return `### ${children}\n\n`;
+    if (tag === "h4" || tag === "h5" || tag === "h6") return `#### ${children}\n\n`;
+    if (tag === "p") return `${children}\n\n`;
+    if (tag === "br") return "\n";
+    if (tag === "strong" || tag === "b") return `**${children}**`;
+    if (tag === "em" || tag === "i") return `*${children}*`;
+    if (tag === "li") return `- ${children}\n`;
+    if (tag === "ul" || tag === "ol") return `${children}\n`;
+    if (tag === "blockquote") return `> ${children}\n\n`;
+    if (tag === "a") return children;
+    if (tag === "div" || tag === "section" || tag === "article") return `${children}\n`;
+    return children;
+  };
+
+  return convert(div)
+    .replace(/\n{3,}/g, "\n\n") // max 2 newlines
+    .trim();
+}
+
 // Score out of 100 — uses raw average across all dimensions (not rounded) for differentiation
 function scoreToHundred(rawAvg) {
   return Math.round((rawAvg / 10) * 100);
@@ -175,7 +209,7 @@ export default function AIProofChecker() {
     const effectivePlatform = effectivePlatforms[0] || ""; // primary for buildDimensions
     const DIMS = buildDimensions(title, effectivePlatform);
     const truncatedBody = body.trim().slice(0, 3000);
-    const fullContent = `${title ? `TITLE: ${title}\n\n` : ""}${platformLabels ? `PLATFORMS: ${platformLabels}\n\n` : ""}BODY:\n${truncatedBody}`;
+    const fullContent = `${title ? `TITLE: ${title}\n\n` : ""}${platformLabels ? `PLATFORMS: ${platformLabels}\n\n` : ""}BODY (may contain markdown formatting where # = H1, ## = H2, **text** = bold, - = list item — treat these as real document structure when scoring):\n${truncatedBody}`;
     const dimResults = {};
     for (let i = 0; i < DIMS.length; i++) {
       setLoadingIndex(i);
@@ -237,11 +271,19 @@ export default function AIProofChecker() {
         const rawResults = searchData.results || [];
 
         if (rawResults.length > 0) {
-          // 2. Analyze gap between surfacing content and user's content
+          // 2. Analyze gap + generate FAQs in one call
+          // If Serper returned PAA use those, otherwise AI generates them
+          const hasPAA = (searchData.peopleAlsoAsk || []).length > 0;
+
           const gapAnalysis = await callAPI(
             "You are a GEO expert. Respond ONLY with valid JSON, no markdown, no backticks.",
-            `Compare this user's content against these top-surfacing results for the query "${searchQuery}" and identify specific gaps.\n\nTop surfacing results:\n${rawResults.map((r, i) => `${i + 1}. "${r.title}" (${r.source})\n${r.snippet}`).join("\n\n")}\n\nUser's content (first 1000 chars):\n"""\n${body.slice(0, 1000)}\n"""\n\nFor each surfacing result, identify 2-3 specific structural properties that help it surface (e.g. "opens with direct answer", "named expert author", "specific statistic in first paragraph", "clear query-matched title").\n\nAlso identify 3 specific gaps — things the surfacing content has that the user's content lacks.\n\nRespond with JSON only:\n{\n  "results": [\n    { "title": "<title>", "source": "<source>", "url": "<url>", "reasons": ["<reason1>", "<reason2>"] }\n  ],\n  "gaps": ["<gap1>", "<gap2>", "<gap3>"]\n}`
+            `Compare this user's content against these top-surfacing results for the query "${searchQuery}" and identify specific gaps.\n\nTop surfacing results:\n${rawResults.map((r, i) => `${i + 1}. "${r.title}" (${r.source})\n${r.snippet}`).join("\n\n")}\n\nUser's content (first 1000 chars):\n"""\n${body.slice(0, 1000)}\n"""\n\nFor each surfacing result, identify 2-3 specific structural properties that help it surface.\n\nAlso identify 3 specific gaps — things the surfacing content has that the user's content lacks.\n\n${!hasPAA ? `Also generate 5 real questions that people commonly ask about "${searchQuery}" — questions someone would type into ChatGPT or Perplexity. Make them specific and varied (how, what, why, which formats).` : ""}\n\nRespond with JSON only:\n{\n  "results": [\n    { "title": "<title>", "source": "<source>", "url": "<url>", "reasons": ["<reason1>", "<reason2>"] }\n  ],\n  "gaps": ["<gap1>", "<gap2>", "<gap3>"]${!hasPAA ? `,\n  "generatedQuestions": ["<question1>", "<question2>", "<question3>", "<question4>", "<question5>"]` : ""}\n}`
           );
+
+          // Use Serper PAA if available, otherwise use AI-generated questions
+          const peopleAlsoAsk = hasPAA
+            ? searchData.peopleAlsoAsk
+            : (gapAnalysis.generatedQuestions || []).map(q => ({ question: q, snippet: null, source: null }));
 
           setSurfacingResults({
             query: searchQuery,
@@ -251,7 +293,10 @@ export default function AIProofChecker() {
               source: rawResults[i]?.source || r.source,
               date: rawResults[i]?.date || null,
             })) || [],
-            gaps: gapAnalysis.gaps || []
+            gaps: gapAnalysis.gaps || [],
+            peopleAlsoAsk,
+            relatedSearches: searchData.relatedSearches || [],
+            paaSource: hasPAA ? "google" : "ai",
           });
         }
       } catch (e) {
@@ -487,7 +532,7 @@ export default function AIProofChecker() {
                 </div>
 
                 {surfacingResults.gaps?.length > 0 && (
-                  <div style={{ background: "rgba(255,107,107,0.06)", border: "1.5px solid rgba(255,107,107,0.2)", borderRadius: "12px", padding: "18px 20px" }}>
+                  <div style={{ background: "rgba(255,107,107,0.06)", border: "1.5px solid rgba(255,107,107,0.2)", borderRadius: "12px", padding: "18px 20px", marginBottom: "12px" }}>
                     <div style={{ fontSize: "11px", color: "#FF6B6B", fontWeight: "700", letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: "12px" }}>
                       What these have that your content doesn't
                     </div>
@@ -497,6 +542,46 @@ export default function AIProofChecker() {
                           <span style={{ color: "#FF6B6B", fontSize: "14px", flexShrink: 0, marginTop: "1px" }}>✗</span>
                           <p style={{ fontSize: "13px", color: "rgba(240,240,248,0.6)", margin: 0, lineHeight: 1.6 }}>{gap}</p>
                         </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* People Also Ask */}
+                {surfacingResults.peopleAlsoAsk?.length > 0 && (
+                  <div style={{ background: "rgba(200,255,0,0.04)", border: "1.5px solid rgba(200,255,0,0.15)", borderRadius: "12px", padding: "18px 20px", marginBottom: "12px" }}>
+                    <div style={{ fontSize: "11px", color: "#C8FF00", fontWeight: "700", letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: "6px" }}>
+                      Questions people are asking around this topic
+                    </div>
+                    <div style={{ fontSize: "12px", color: "rgba(240,240,248,0.35)", marginBottom: "14px" }}>
+                      {surfacingResults.paaSource === "ai" ? "AI-generated based on your topic — each one is a content opportunity you could address" : "Real queries from Google — each one is a content opportunity you could address"}
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                      {surfacingResults.peopleAlsoAsk.map((q, i) => (
+                        <div key={i} style={{ display: "flex", gap: "10px", alignItems: "start", background: "rgba(255,255,255,0.03)", border: "1px solid rgba(200,255,0,0.1)", borderRadius: "8px", padding: "10px 14px" }}>
+                          <span style={{ color: "#C8FF00", fontSize: "13px", flexShrink: 0, marginTop: "1px", fontFamily: "'Space Mono', monospace" }}>?</span>
+                          <div>
+                            <p style={{ fontSize: "13px", color: "rgba(240,240,248,0.8)", margin: "0 0 4px", fontWeight: "600", fontFamily: "'Space Mono', monospace" }}>{q.question}</p>
+                            {q.snippet && <p style={{ fontSize: "12px", color: "rgba(240,240,248,0.4)", margin: 0, lineHeight: 1.55 }}>{q.snippet}</p>}
+                            {q.source && <p style={{ fontSize: "11px", color: "rgba(240,240,248,0.25)", margin: "4px 0 0" }}>{q.source}</p>}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Related searches */}
+                {surfacingResults.relatedSearches?.length > 0 && (
+                  <div style={{ background: "rgba(255,255,255,0.02)", border: "1.5px solid rgba(255,255,255,0.07)", borderRadius: "12px", padding: "16px 20px" }}>
+                    <div style={{ fontSize: "11px", color: "rgba(240,240,248,0.4)", fontWeight: "700", letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: "12px" }}>
+                      Related searches
+                    </div>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: "8px" }}>
+                      {surfacingResults.relatedSearches.map((s, i) => (
+                        <span key={i} style={{ fontSize: "12px", color: "rgba(240,240,248,0.55)", background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: "99px", padding: "5px 12px" }}>
+                          {s}
+                        </span>
                       ))}
                     </div>
                   </div>
@@ -625,9 +710,32 @@ export default function AIProofChecker() {
                 Content body
                 <span style={{ fontSize: "10px", color: "#C8FF00", textTransform: "none", letterSpacing: 0, fontStyle: "italic", background: "rgba(200,255,0,0.1)", borderRadius: "4px", padding: "1px 6px" }}>required</span>
               </label>
-              <textarea value={body} onChange={e => setBody(e.target.value)} placeholder="Paste the body of your content here — blog post, article, landing page, thread..."
+              <textarea value={body}
+                onChange={e => setBody(e.target.value)}
+                onPaste={e => {
+                  // Intercept paste — if HTML is available (Google Docs, Notion, Medium etc)
+                  // convert it to clean markdown-style text preserving H1/H2/H3, bold, lists
+                  const html = e.clipboardData.getData("text/html");
+                  if (html && html.trim()) {
+                    e.preventDefault();
+                    const converted = htmlToText(html);
+                    // Insert at cursor position or replace selection
+                    const el = e.target;
+                    const start = el.selectionStart;
+                    const end = el.selectionEnd;
+                    const newVal = body.slice(0, start) + converted + body.slice(end);
+                    setBody(newVal);
+                    // Restore cursor position after converted text
+                    setTimeout(() => { el.selectionStart = el.selectionEnd = start + converted.length; }, 0);
+                  }
+                  // If no HTML, let default paste handle it (plain text)
+                }}
+                placeholder="Paste the body of your content here — Google Docs, Notion, Medium, blog post, article, thread..."
                 style={{ ...fieldStyle("body"), minHeight: "170px", resize: "vertical", lineHeight: 1.75, display: "block" }}
                 onFocus={() => setFocused("body")} onBlur={() => setFocused(null)} />
+              <div style={{ fontSize: "11px", color: "rgba(240,240,248,0.25)", marginTop: "6px", fontStyle: "italic" }}>
+                Formatting from Google Docs, Notion, and Medium is automatically preserved ✦
+              </div>
             </div>
 
             {/* Platform */}
